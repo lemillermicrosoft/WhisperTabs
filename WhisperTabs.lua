@@ -10,6 +10,7 @@ local defaults = {
   persist       = true,    -- restore tabs across sessions
   maxTabs       = 20,      -- safety cap
   routeExisting = true,    -- also route to a pre-existing tab named after the player
+  autoSwitch    = false,   -- switch focus to the new tab when it opens (never in combat)
 }
 
 -- Runtime state: playerName (normalized) -> ChatFrame table.
@@ -103,6 +104,9 @@ local function ensureTab(playerName)
     return nil
   end
 
+  -- Remember which tab had focus so we can restore it if autoSwitch is off.
+  local prevSelected = SELECTED_CHAT_FRAME
+
   local frame = FCF_OpenNewWindow(title)
   if not frame then
     -- Some clients return nil and instead use the "next available" frame.
@@ -116,6 +120,18 @@ local function ensureTab(playerName)
 
   configureWhisperFrame(frame, playerName)
   openTabs[key] = frame
+
+  -- FCF_OpenNewWindow selects the new tab. Restore focus unless the user opted in,
+  -- and NEVER auto-switch during combat lockdown regardless of setting.
+  local inCombat = InCombatLockdown and InCombatLockdown()
+  if (not WhisperTabsDB.autoSwitch) or inCombat then
+    if prevSelected and FCF_SelectDockFrame then
+      -- FCF_SelectDockFrame is the safe, non-protected switcher for docked frames.
+      FCF_SelectDockFrame(prevSelected)
+    elseif prevSelected and prevSelected.SetFocus then
+      SELECTED_CHAT_FRAME = prevSelected
+    end
+  end
 
   if WhisperTabsDB.persist then
     -- Store by normalized full name so cross-realm re-open works.
@@ -219,9 +235,11 @@ SlashCmdList["WHISPERTABS"] = function(msg)
   if msg == "" or msg == "help" then
     print_("commands:")
     print_("  /wtabs on|off        - enable/disable auto-tabbing")
+    print_("  /wtabs autoswitch on|off - switch focus to new tab (never in combat)")
     print_("  /wtabs persist on|off- restore tabs across sessions")
     print_("  /wtabs max <n>       - max concurrent tabs (default 20)")
     print_("  /wtabs clear         - forget persisted tab list")
+    print_("  /wtabs options       - open Blizzard options panel")
     print_("  /wtabs status        - show current settings")
   elseif msg == "on" then
     WhisperTabsDB.enabled = true;  print_("enabled")
@@ -231,6 +249,12 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     WhisperTabsDB.persist = true;  print_("persist: on")
   elseif msg == "persist off" then
     WhisperTabsDB.persist = false; print_("persist: off")
+  elseif msg == "autoswitch on" then
+    WhisperTabsDB.autoSwitch = true;  print_("autoSwitch: on (never applies in combat)")
+  elseif msg == "autoswitch off" then
+    WhisperTabsDB.autoSwitch = false; print_("autoSwitch: off")
+  elseif msg == "options" or msg == "config" then
+    if ns.OpenOptions then ns.OpenOptions() end
   elseif msg:match("^max%s+(%d+)$") then
     local n = tonumber(msg:match("^max%s+(%d+)$"))
     WhisperTabsDB.maxTabs = math.max(1, math.min(50, n))
@@ -239,8 +263,9 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     WhisperTabsDB.tabs = {}
     print_("persisted tab list cleared (existing tabs remain until /reload)")
   elseif msg == "status" then
-    print_(string.format("enabled=%s persist=%s maxTabs=%d openTabs=%d",
-      tostring(WhisperTabsDB.enabled), tostring(WhisperTabsDB.persist),
+    print_(string.format("enabled=%s autoSwitch=%s persist=%s maxTabs=%d openTabs=%d",
+      tostring(WhisperTabsDB.enabled), tostring(WhisperTabsDB.autoSwitch),
+      tostring(WhisperTabsDB.persist),
       WhisperTabsDB.maxTabs or defaults.maxTabs, (function() local c=0; for _ in pairs(openTabs) do c=c+1 end; return c end)()))
   else
     print_("unknown command. try /wtabs help")
