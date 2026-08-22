@@ -67,14 +67,33 @@ local function configureWhisperFrame(frame, playerName)
   frame.whisperTabsPlayer = playerName
 end
 
+-- Is a chat window slot still a real, user-visible tab?
+-- After a user closes a tab via the UI, GetChatWindowInfo(id) returns nil or
+-- empty for that slot. That's our liveness probe.
+local function isFrameAlive(frame)
+  if not frame then return false end
+  local id = frame.GetID and frame:GetID() or nil
+  if not id then return false end
+  local name = GetChatWindowInfo(id)
+  if not name or name == "" then return false end
+  -- Also make sure the tab UI still exists.
+  local tabBtn = _G["ChatFrame" .. id .. "Tab"]
+  if not tabBtn then return false end
+  return true
+end
+
 -- Create (or reuse) a tab for playerName. Returns the ChatFrame or nil.
 local function ensureTab(playerName)
   local key = keyFor(playerName)
   if not key then return nil end
 
   local existing = openTabs[key]
-  if existing and existing:IsShown() ~= nil then
+  if existing and isFrameAlive(existing) then
     return existing
+  elseif existing then
+    -- Cached frame is dead (user closed the tab). Evict and fall through.
+    openTabs[key] = nil
+    INJECT_LOCK[existing] = nil
   end
 
   local title = tabTitleFor(playerName)
@@ -253,16 +272,19 @@ end
 -- Restore persisted tabs on login.
 local function restorePersistedTabs()
   if not WhisperTabsDB.persist then return end
+  local kept = {}
   for _, playerName in ipairs(WhisperTabsDB.tabs or {}) do
-    -- Attach to any existing frame by that title; don't spawn until real traffic
-    -- so we don't clutter after an /uninstall-ish cleanup.
     local title = tabTitleFor(playerName)
     local frame = findChatFrameByName(title)
-    if frame then
+    if frame and isFrameAlive(frame) then
       configureWhisperFrame(frame, playerName)
       openTabs[keyFor(playerName)] = frame
+      table.insert(kept, playerName)
     end
+    -- If not found or not alive: drop from persisted list. Next real whisper
+    -- from this player will spawn a fresh tab cleanly.
   end
+  WhisperTabsDB.tabs = kept
 end
 
 -- ---------- events ----------
