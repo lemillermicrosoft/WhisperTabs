@@ -182,11 +182,22 @@ local function makeFilter(event)
     if not WhisperTabsDB.enabled then return false end
     if not author or author == "" then return false end
 
+    -- COMBAT LOCKDOWN SAFETY (see WIM's docs, issue #6):
+    --   Calling ChatFrame_MessageEventHandler, FCF_*, or returning true from
+    --   this filter during lockdown risks tainting the default chat frame,
+    --   which cascades into broken action bars, /r keybind, etc. So during
+    --   combat: do nothing. Let Blizzard's default dispatch route the whisper
+    --   to whatever frames it normally would (General stays whisper-capable).
+    --   After combat, normal per-tab routing resumes for subsequent whispers.
+    if InCombatLockdown and InCombatLockdown() then
+      return false
+    end
+
     -- Ensure a tab exists for this author.
     local tab = ensureTab(author)
 
-    -- If tab creation failed (combat, cap), fall back to default routing so the
-    -- message doesn't get lost.
+    -- If tab creation failed (cap, or ensureTab deferred to post-combat),
+    -- fall back to default routing so the message doesn't get lost.
     if not tab then return false end
 
     -- Dedupe key so we don't inject the same message twice.
