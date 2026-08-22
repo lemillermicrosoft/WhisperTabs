@@ -6,11 +6,12 @@ local ADDON_NAME, ns = ...
 
 WhisperTabsDB = WhisperTabsDB or {}
 local defaults = {
-  enabled       = true,
-  persist       = true,    -- restore tabs across sessions
-  maxTabs       = 20,      -- safety cap
-  routeExisting = true,    -- also route to a pre-existing tab named after the player
-  autoSwitch    = false,   -- switch focus to the new tab when it opens (never in combat)
+  enabled            = true,
+  persist            = true,    -- restore tabs across sessions
+  maxTabs            = 20,      -- safety cap
+  routeExisting      = true,    -- also route to a pre-existing tab named after the player
+  autoSwitch         = false,   -- switch focus to the new tab when it opens (never in combat)
+  duplicateInGeneral = true,    -- also keep whispers in the default (General) chat frame
 }
 
 -- Runtime state: playerName (normalized) -> ChatFrame table.
@@ -146,13 +147,35 @@ end
 
 -- ---------- message routing ----------
 --
--- Strategy: install AddMessageEventFilters for the whisper events that mark the
--- message as belonging to a specific tab. The default handler then only shows
--- it in frames registered for WHISPER — which means it would still appear in
--- the main window if the main window is registered for WHISPER. We can't easily
--- unregister the main window without user-facing side effects, so instead we
--- filter: if a tab exists for this player, suppress the message from all other
--- frames by returning true from the filter for those frames.
+-- Correct strategy:
+--
+--   AddMessageEventFilter runs once per (event, frame) pair. We use it to
+--   actively DELIVER the whisper into the correct tab (via ChatFrame_MessageEventHandler)
+--   AND suppress duplicate deliveries in other whisper-capable frames, honoring
+--   the duplicateInGeneral toggle for the DEFAULT_CHAT_FRAME.
+--
+-- Why we can't just rely on the default handler:
+--   The default handler dispatches CHAT_MSG_WHISPER to every ChatFrame that has
+--   the WHISPER message group registered at dispatch time. If we register the
+--   tab lazily inside the filter, the tab is created but the *current* message
+--   won't be dispatched to it — so the first whisper appears empty. Injecting
+--   manually fixes that.
+--
+-- To avoid the tab getting the message twice (once via our inject, once via
+-- default dispatch because we registered it for WHISPER), we mark the tab
+-- injected message with a token and short-circuit re-entry.
+
+local INJECT_LOCK = {} -- per-tab dedupe token, keyed by frame -> lastKey
+
+local function isWhisperCapable(frame)
+  local id = frame and frame:GetID()
+  if not id then return false end
+  local groups = { GetChatWindowMessages(id) }
+  for _, g in ipairs(groups) do
+    if g == "WHISPER" or g == "BN_WHISPER" then return true end
+  end
+  return false
+end
 
 local function makeFilter(event)
   return function(chatFrame, evt, msg, author, ...)
@@ -161,19 +184,48 @@ local function makeFilter(event)
 
     -- Ensure a tab exists for this author.
     local tab = ensureTab(author)
-    if not tab then return false end -- couldn't open (combat, cap); let default handling apply
 
-    -- If this frame IS the tab, allow.
-    if chatFrame == tab then return false end
+    -- If tab creation failed (combat, cap), fall back to default routing so the
+    -- message doesn't get lost.
+    if not tab then return false end
 
-    -- Otherwise, only allow if this frame isn't a candidate for whispers at all.
-    -- If chatFrame has WHISPER in its message groups, suppress.
-    local groups = { GetChatWindowMessages(chatFrame:GetID()) }
-    for _, g in ipairs(groups) do
-      if g == "WHISPER" or g == "BN_WHISPER" then
-        return true -- suppress duplicate in non-tab whisper-capable frames
+    -- Dedupe key so we don't inject the same message twice.
+    local dedupeKey = evt .. "|" .. author .. "|" .. (msg or "") .. "|" .. tostring(GetTime())
+
+    -- Case A: this filter invocation is for the TAB itself.
+    --   Let the default handler render it normally (it's registered for WHISPER).
+    --   Mark it as "seen" for suppression logic below.
+    if chatFrame == tab then
+      INJECT_LOCK[tab] = dedupeKey
+      return false
+    end
+
+    -- Case B: this filter invocation is for some OTHER frame.
+    --   Sub-case B1: the tab is NOT yet registered for WHISPER (freshly created
+    --   this tick — the default dispatcher already computed its target list
+    --   before ensureTab ran). Manually inject into the tab, then decide
+    --   whether to suppress here.
+    if INJECT_LOCK[tab] ~= dedupeKey then
+      ChatFrame_MessageEventHandler(tab, evt, msg, author, ...)
+      INJECT_LOCK[tab] = dedupeKey
+    end
+
+    -- Sub-case B2: is this frame the DEFAULT_CHAT_FRAME (General)?
+    --   Honor duplicateInGeneral: if on, keep the message here too.
+    if chatFrame == DEFAULT_CHAT_FRAME then
+      if WhisperTabsDB.duplicateInGeneral then
+        return false -- allow default render in General
+      else
+        return true  -- suppress from General
       end
     end
+
+    -- Sub-case B3: any other whisper-capable frame — suppress to avoid dupes.
+    if isWhisperCapable(chatFrame) then
+      return true
+    end
+
+    -- Not whisper-capable frame; default handler will ignore anyway.
     return false
   end
 end
@@ -236,6 +288,7 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     print_("commands:")
     print_("  /wtabs on|off        - enable/disable auto-tabbing")
     print_("  /wtabs autoswitch on|off - switch focus to new tab (never in combat)")
+    print_("  /wtabs general on|off - also show whispers in the default (General) chat")
     print_("  /wtabs persist on|off- restore tabs across sessions")
     print_("  /wtabs max <n>       - max concurrent tabs (default 20)")
     print_("  /wtabs clear         - forget persisted tab list")
@@ -253,6 +306,10 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     WhisperTabsDB.autoSwitch = true;  print_("autoSwitch: on (never applies in combat)")
   elseif msg == "autoswitch off" then
     WhisperTabsDB.autoSwitch = false; print_("autoSwitch: off")
+  elseif msg == "general on" then
+    WhisperTabsDB.duplicateInGeneral = true;  print_("duplicateInGeneral: on (whispers also stay in General)")
+  elseif msg == "general off" then
+    WhisperTabsDB.duplicateInGeneral = false; print_("duplicateInGeneral: off (whispers only in tabs)")
   elseif msg == "options" or msg == "config" then
     if ns.OpenOptions then ns.OpenOptions() end
   elseif msg:match("^max%s+(%d+)$") then
@@ -263,8 +320,9 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     WhisperTabsDB.tabs = {}
     print_("persisted tab list cleared (existing tabs remain until /reload)")
   elseif msg == "status" then
-    print_(string.format("enabled=%s autoSwitch=%s persist=%s maxTabs=%d openTabs=%d",
+    print_(string.format("enabled=%s autoSwitch=%s duplicateInGeneral=%s persist=%s maxTabs=%d openTabs=%d",
       tostring(WhisperTabsDB.enabled), tostring(WhisperTabsDB.autoSwitch),
+      tostring(WhisperTabsDB.duplicateInGeneral),
       tostring(WhisperTabsDB.persist),
       WhisperTabsDB.maxTabs or defaults.maxTabs, (function() local c=0; for _ in pairs(openTabs) do c=c+1 end; return c end)()))
   else

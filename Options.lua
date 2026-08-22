@@ -62,11 +62,17 @@ local cbAutoSwitch = makeCheckbox(panel, "Switch focus to new whisper tab",
   function(v) DB().autoSwitch = v end)
 cbAutoSwitch:SetPoint("TOPLEFT", cbEnabled, "BOTTOMLEFT", 0, -4)
 
+local cbDuplicate = makeCheckbox(panel, "Also show whispers in General chat",
+  "Keep whispers visible in the default (General) chat frame in addition to the per-conversation tab.",
+  function() return DB().duplicateInGeneral end,
+  function(v) DB().duplicateInGeneral = v end)
+cbDuplicate:SetPoint("TOPLEFT", cbAutoSwitch, "BOTTOMLEFT", 0, -4)
+
 local cbPersist = makeCheckbox(panel, "Persist tabs across sessions",
   "Remember whisper tabs across /reload and re-login.",
   function() return DB().persist end,
   function(v) DB().persist = v end)
-cbPersist:SetPoint("TOPLEFT", cbAutoSwitch, "BOTTOMLEFT", 0, -4)
+cbPersist:SetPoint("TOPLEFT", cbDuplicate, "BOTTOMLEFT", 0, -4)
 
 local slMax = makeSlider(panel, "Max concurrent tabs", 1, 50, 1,
   function() return DB().maxTabs or 20 end,
