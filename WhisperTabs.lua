@@ -93,7 +93,6 @@ local function ensureTab(playerName)
   elseif existing then
     -- Cached frame is dead (user closed the tab). Evict and fall through.
     openTabs[key] = nil
-    INJECT_LOCK[existing] = nil
   end
 
   local title = tabTitleFor(playerName)
@@ -166,25 +165,24 @@ end
 
 -- ---------- message routing ----------
 --
--- Correct strategy:
+-- Design (post issue #9):
 --
---   AddMessageEventFilter runs once per (event, frame) pair. We use it to
---   actively DELIVER the whisper into the correct tab (via ChatFrame_MessageEventHandler)
---   AND suppress duplicate deliveries in other whisper-capable frames, honoring
---   the duplicateInGeneral toggle for the DEFAULT_CHAT_FRAME.
+--   We DO NOT call ChatFrame_MessageEventHandler ourselves. ElvUI and other
+--   chat overhauls replace/shadow it, causing nil-call errors. WIM also warned
+--   this pattern taints in combat.
 --
--- Why we can't just rely on the default handler:
---   The default handler dispatches CHAT_MSG_WHISPER to every ChatFrame that has
---   the WHISPER message group registered at dispatch time. If we register the
---   tab lazily inside the filter, the tab is created but the *current* message
---   won't be dispatched to it — so the first whisper appears empty. Injecting
---   manually fixes that.
+--   Instead: when a tab is created/adopted, register it for the WHISPER /
+--   BN_WHISPER message groups. Blizzard's own dispatcher will then deliver
+--   subsequent whispers to it naturally, alongside any other whisper-capable
+--   frames (like General).
 --
--- To avoid the tab getting the message twice (once via our inject, once via
--- default dispatch because we registered it for WHISPER), we mark the tab
--- injected message with a token and short-circuit re-entry.
-
-local INJECT_LOCK = {} -- per-tab dedupe token, keyed by frame -> lastKey
+--   Filter's ONLY job: decide whether to suppress duplicate delivery in
+--   non-tab whisper-capable frames, honoring the duplicateInGeneral toggle.
+--
+--   Consequence: the very first whisper from a brand-new author may only
+--   appear in General (because the tab didn't exist when the current dispatch
+--   computed its target set). Every whisper after that lands in the tab.
+--   Acceptable tradeoff for zero-taint + ElvUI compatibility.
 
 local function isWhisperCapable(frame)
   local id = frame and frame:GetID()
@@ -201,61 +199,38 @@ local function makeFilter(event)
     if not WhisperTabsDB.enabled then return false end
     if not author or author == "" then return false end
 
-    -- COMBAT LOCKDOWN SAFETY (see WIM's docs, issue #6):
-    --   Calling ChatFrame_MessageEventHandler, FCF_*, or returning true from
-    --   this filter during lockdown risks tainting the default chat frame,
-    --   which cascades into broken action bars, /r keybind, etc. So during
-    --   combat: do nothing. Let Blizzard's default dispatch route the whisper
-    --   to whatever frames it normally would (General stays whisper-capable).
-    --   After combat, normal per-tab routing resumes for subsequent whispers.
+    -- COMBAT LOCKDOWN SAFETY (issue #6): do nothing during combat.
+    -- No tab creation, no suppression, no frame manipulation. Blizzard's
+    -- untampered default dispatch handles it; whispers still show in General.
     if InCombatLockdown and InCombatLockdown() then
       return false
     end
 
-    -- Ensure a tab exists for this author.
+    -- Ensure a tab exists for this author. This also registers it for the
+    -- WHISPER message groups so future dispatches deliver here automatically.
     local tab = ensureTab(author)
 
-    -- If tab creation failed (cap, or ensureTab deferred to post-combat),
-    -- fall back to default routing so the message doesn't get lost.
+    -- If tab creation failed (cap, or deferred), fall back to default routing.
     if not tab then return false end
 
-    -- Dedupe key so we don't inject the same message twice.
-    local dedupeKey = evt .. "|" .. author .. "|" .. (msg or "") .. "|" .. tostring(GetTime())
+    -- If this filter invocation is for the tab itself, allow render.
+    if chatFrame == tab then return false end
 
-    -- Case A: this filter invocation is for the TAB itself.
-    --   Let the default handler render it normally (it's registered for WHISPER).
-    --   Mark it as "seen" for suppression logic below.
-    if chatFrame == tab then
-      INJECT_LOCK[tab] = dedupeKey
-      return false
-    end
-
-    -- Case B: this filter invocation is for some OTHER frame.
-    --   Sub-case B1: the tab is NOT yet registered for WHISPER (freshly created
-    --   this tick — the default dispatcher already computed its target list
-    --   before ensureTab ran). Manually inject into the tab, then decide
-    --   whether to suppress here.
-    if INJECT_LOCK[tab] ~= dedupeKey then
-      ChatFrame_MessageEventHandler(tab, evt, msg, author, ...)
-      INJECT_LOCK[tab] = dedupeKey
-    end
-
-    -- Sub-case B2: is this frame the DEFAULT_CHAT_FRAME (General)?
-    --   Honor duplicateInGeneral: if on, keep the message here too.
+    -- For OTHER frames: decide suppression.
+    -- DEFAULT_CHAT_FRAME (General) respects duplicateInGeneral.
     if chatFrame == DEFAULT_CHAT_FRAME then
       if WhisperTabsDB.duplicateInGeneral then
-        return false -- allow default render in General
+        return false
       else
-        return true  -- suppress from General
+        return true
       end
     end
 
-    -- Sub-case B3: any other whisper-capable frame — suppress to avoid dupes.
+    -- Any other whisper-capable frame: suppress to avoid dupes.
     if isWhisperCapable(chatFrame) then
       return true
     end
 
-    -- Not whisper-capable frame; default handler will ignore anyway.
     return false
   end
 end
