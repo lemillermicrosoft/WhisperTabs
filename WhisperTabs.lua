@@ -63,7 +63,10 @@ local function findChatFrameByName(name)
   return hiddenMatch, hiddenIdx
 end
 
--- Ensure a frame + its tab button are actually visible and docked.
+-- Ensure a frame + its tab button are actually visible. Deliberately does NOT
+-- force-dock — that fights ElvUI's chat layout and causes visual shuffling when
+-- switching tabs. If the frame was docked before being closed, it'll re-dock
+-- naturally; if it was floating, we leave it floating.
 local function forceShowFrame(frame)
   if not frame then return end
   local id = frame:GetID()
@@ -73,11 +76,6 @@ local function forceShowFrame(frame)
     tabBtn:Show()
     if tabBtn.SetAlpha then tabBtn:SetAlpha(1) end
   end
-  if FCF_DockFrame and not frame.isDocked then
-    FCF_DockFrame(frame)
-  end
-  -- Blizzard's shown flag lives in the saved layout; poke it so it sticks.
-  if FCF_SetTabPosition then FCF_SetTabPosition(frame, 0) end
 end
 
 -- Configure a chat frame to only display whispers to/from playerName.
