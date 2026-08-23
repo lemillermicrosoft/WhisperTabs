@@ -44,13 +44,19 @@ local function print_(msg)
 end
 
 -- Find an existing chat window by exact tab title (case-insensitive).
+-- Only returns visible/shown slots — a closed tab keeps its name in the layout
+-- but we don't want to route whispers into an invisible ghost slot.
 local function findChatFrameByName(name)
   if not name then return nil end
   local target = name:lower()
   for i = 1, NUM_CHAT_WINDOWS do
-    local title = GetChatWindowInfo(i)
-    if title and title:lower() == target then
-      return _G["ChatFrame" .. i], i
+    local title, _, _, _, _, _, shown = GetChatWindowInfo(i)
+    if title and title:lower() == target and shown then
+      local cf = _G["ChatFrame" .. i]
+      local tabBtn = _G["ChatFrame" .. i .. "Tab"]
+      if cf and tabBtn and tabBtn:IsShown() then
+        return cf, i
+      end
     end
   end
   return nil
@@ -68,17 +74,21 @@ local function configureWhisperFrame(frame, playerName)
 end
 
 -- Is a chat window slot still a real, user-visible tab?
--- After a user closes a tab via the UI, GetChatWindowInfo(id) returns nil or
--- empty for that slot. That's our liveness probe.
+--
+-- A closed tab in WoW keeps its slot name in the saved layout but is hidden.
+-- So `name ~= ""` alone is NOT sufficient — we also need the frame to be shown.
+-- Otherwise we'll adopt a ghost slot and route whispers into an invisible tab
+-- (see issue #10 debug: slot 6 name="Deehorlok" shown=false).
 local function isFrameAlive(frame)
   if not frame then return false end
   local id = frame.GetID and frame:GetID() or nil
   if not id then return false end
-  local name = GetChatWindowInfo(id)
+  local name, _, _, _, _, _, shown = GetChatWindowInfo(id)
   if not name or name == "" then return false end
-  -- Also make sure the tab UI still exists.
+  if not shown then return false end
   local tabBtn = _G["ChatFrame" .. id .. "Tab"]
   if not tabBtn then return false end
+  if not tabBtn:IsShown() then return false end
   return true
 end
 
