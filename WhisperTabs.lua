@@ -44,22 +44,40 @@ local function print_(msg)
 end
 
 -- Find an existing chat window by exact tab title (case-insensitive).
--- Only returns visible/shown slots — a closed tab keeps its name in the layout
--- but we don't want to route whispers into an invisible ghost slot.
+-- Prefers a currently-shown match; falls back to a hidden match so we can
+-- ADOPT and RE-SHOW it instead of spawning yet another duplicate slot (#10).
 local function findChatFrameByName(name)
-  if not name then return nil end
+  if not name then return nil, nil end
   local target = name:lower()
+  local hiddenMatch, hiddenIdx
   for i = 1, NUM_CHAT_WINDOWS do
     local title, _, _, _, _, _, shown = GetChatWindowInfo(i)
-    if title and title:lower() == target and shown then
+    if title and title:lower() == target then
       local cf = _G["ChatFrame" .. i]
-      local tabBtn = _G["ChatFrame" .. i .. "Tab"]
-      if cf and tabBtn and tabBtn:IsShown() then
-        return cf, i
+      if cf then
+        if shown then return cf, i end
+        if not hiddenMatch then hiddenMatch, hiddenIdx = cf, i end
       end
     end
   end
-  return nil
+  return hiddenMatch, hiddenIdx
+end
+
+-- Ensure a frame + its tab button are actually visible and docked.
+local function forceShowFrame(frame)
+  if not frame then return end
+  local id = frame:GetID()
+  frame:Show()
+  local tabBtn = _G["ChatFrame" .. id .. "Tab"]
+  if tabBtn then
+    tabBtn:Show()
+    if tabBtn.SetAlpha then tabBtn:SetAlpha(1) end
+  end
+  if FCF_DockFrame and not frame.isDocked then
+    FCF_DockFrame(frame)
+  end
+  -- Blizzard's shown flag lives in the saved layout; poke it so it sticks.
+  if FCF_SetTabPosition then FCF_SetTabPosition(frame, 0) end
 end
 
 -- Configure a chat frame to only display whispers to/from playerName.
@@ -108,9 +126,12 @@ local function ensureTab(playerName)
   local title = tabTitleFor(playerName)
 
   -- Reuse a pre-existing tab if the user (or a prior session) already made one.
+  -- This includes HIDDEN slots with the same name — we adopt and re-show them
+  -- rather than piling up duplicates in the saved layout (#10).
   if WhisperTabsDB.routeExisting then
     local frame = findChatFrameByName(title)
     if frame then
+      forceShowFrame(frame)
       configureWhisperFrame(frame, playerName)
       openTabs[key] = frame
       return frame
@@ -165,21 +186,10 @@ local function ensureTab(playerName)
   -- Force-show the frame and its tab button. FCF_Close hides both without
   -- destroying them, and FCF_OpenNewWindow doesn't always re-show a recycled
   -- slot (esp. under ElvUI). See issue #10.
-  local fid = frame:GetID()
-  frame:Show()
-  local tabBtn = _G["ChatFrame" .. fid .. "Tab"]
-  if tabBtn then
-    tabBtn:Show()
-    if tabBtn.SetAlpha then tabBtn:SetAlpha(1) end
-  end
+  forceShowFrame(frame)
 
   -- Re-assign name in case the recycled slot kept a stale/empty one.
   if FCF_SetWindowName then FCF_SetWindowName(frame, title) end
-
-  -- Re-dock if we're recycling a previously-undocked-then-closed slot.
-  if FCF_DockFrame and not frame.isDocked then
-    FCF_DockFrame(frame)
-  end
 
   configureWhisperFrame(frame, playerName)
   openTabs[key] = frame
@@ -345,6 +355,7 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     print_("  /wtabs max <n>       - max concurrent tabs (default 20)")
     print_("  /wtabs clear         - forget persisted tab list")
     print_("  /wtabs options       - open Blizzard options panel")
+    print_("  /wtabs cleanup       - close all hidden ghost tab slots (recovery)")
     print_("  /wtabs debug         - dump chat window + tab tracking state")
     print_("  /wtabs reset         - clear all WhisperTabs tab tracking")
     print_("  /wtabs status        - show current settings")
@@ -373,6 +384,23 @@ SlashCmdList["WHISPERTABS"] = function(msg)
   elseif msg == "clear" then
     WhisperTabsDB.tabs = {}
     print_("persisted tab list cleared (existing tabs remain until /reload)")
+  elseif msg == "cleanup" then
+    -- Find all hidden slots and Close them so Blizzard frees their names.
+    -- This cleans up ghost duplicates left over from prior WhisperTabs bugs.
+    local closed = 0
+    for i = 3, NUM_CHAT_WINDOWS do -- skip General (1) and Log (2)
+      local name, _, _, _, _, _, shown = GetChatWindowInfo(i)
+      if name and name ~= "" and not shown then
+        local cf = _G["ChatFrame" .. i]
+        if cf and FCF_Close then
+          FCF_Close(cf)
+          closed = closed + 1
+        end
+      end
+    end
+    for k in pairs(openTabs) do openTabs[k] = nil end
+    WhisperTabsDB.tabs = {}
+    print_(string.format("cleanup: closed %d hidden ghost slot(s). /reload recommended.", closed))
   elseif msg == "debug" then
     print_("--- debug dump ---")
     print_("NUM_CHAT_WINDOWS=" .. tostring(NUM_CHAT_WINDOWS))
