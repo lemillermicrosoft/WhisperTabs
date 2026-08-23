@@ -335,6 +335,8 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     print_("  /wtabs max <n>       - max concurrent tabs (default 20)")
     print_("  /wtabs clear         - forget persisted tab list")
     print_("  /wtabs options       - open Blizzard options panel")
+    print_("  /wtabs debug         - dump chat window + tab tracking state")
+    print_("  /wtabs reset         - clear all WhisperTabs tab tracking")
     print_("  /wtabs status        - show current settings")
   elseif msg == "on" then
     WhisperTabsDB.enabled = true;  print_("enabled")
@@ -361,6 +363,31 @@ SlashCmdList["WHISPERTABS"] = function(msg)
   elseif msg == "clear" then
     WhisperTabsDB.tabs = {}
     print_("persisted tab list cleared (existing tabs remain until /reload)")
+  elseif msg == "debug" then
+    print_("--- debug dump ---")
+    print_("NUM_CHAT_WINDOWS=" .. tostring(NUM_CHAT_WINDOWS))
+    for i = 1, NUM_CHAT_WINDOWS do
+      local name, _, _, _, _, _, shown, _, docked = GetChatWindowInfo(i)
+      local cf = _G["ChatFrame" .. i]
+      local visible = cf and cf:IsShown()
+      print_(string.format("  slot %d: name=%q shown=%s visible=%s docked=%s",
+        i, tostring(name or ""), tostring(shown), tostring(visible), tostring(docked)))
+    end
+    print_("openTabs runtime map:")
+    for k, f in pairs(openTabs) do
+      local fid = f and f.GetID and f:GetID() or "?"
+      local alive = isFrameAlive(f)
+      print_(string.format("  %s -> ChatFrame%s alive=%s", tostring(k), tostring(fid), tostring(alive)))
+    end
+    print_("persisted list (WhisperTabsDB.tabs):")
+    for i, n in ipairs(WhisperTabsDB.tabs or {}) do
+      print_(string.format("  [%d] %s", i, tostring(n)))
+    end
+    print_("--- end debug ---")
+  elseif msg == "reset" then
+    WhisperTabsDB.tabs = {}
+    for k in pairs(openTabs) do openTabs[k] = nil end
+    print_("reset runtime + persisted tab tracking. /reload for a clean slate.")
   elseif msg == "status" then
     print_(string.format("enabled=%s autoSwitch=%s duplicateInGeneral=%s persist=%s maxTabs=%d openTabs=%d",
       tostring(WhisperTabsDB.enabled), tostring(WhisperTabsDB.autoSwitch),
