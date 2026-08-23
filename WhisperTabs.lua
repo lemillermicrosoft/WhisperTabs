@@ -133,8 +133,42 @@ local function ensureTab(playerName)
     frame = findChatFrameByName(title)
   end
   if not frame then
+    -- Second fallback: the previously-closed slot may not have been rebound to
+    -- our title. Find any inactive slot, name it, and use that.
+    for i = 1, NUM_CHAT_WINDOWS do
+      local name = GetChatWindowInfo(i)
+      if not name or name == "" then
+        local cf = _G["ChatFrame" .. i]
+        if cf and FCF_SetWindowName then
+          FCF_SetWindowName(cf, title)
+          frame = cf
+          break
+        end
+      end
+    end
+  end
+  if not frame then
     print_("failed to open tab for " .. title)
     return nil
+  end
+
+  -- Force-show the frame and its tab button. FCF_Close hides both without
+  -- destroying them, and FCF_OpenNewWindow doesn't always re-show a recycled
+  -- slot (esp. under ElvUI). See issue #10.
+  local fid = frame:GetID()
+  frame:Show()
+  local tabBtn = _G["ChatFrame" .. fid .. "Tab"]
+  if tabBtn then
+    tabBtn:Show()
+    if tabBtn.SetAlpha then tabBtn:SetAlpha(1) end
+  end
+
+  -- Re-assign name in case the recycled slot kept a stale/empty one.
+  if FCF_SetWindowName then FCF_SetWindowName(frame, title) end
+
+  -- Re-dock if we're recycling a previously-undocked-then-closed slot.
+  if FCF_DockFrame and not frame.isDocked then
+    FCF_DockFrame(frame)
   end
 
   configureWhisperFrame(frame, playerName)
