@@ -1,11 +1,7 @@
-﻿# v0.2.0
+﻿# v0.2.1
 
-Initial tagged release.
+Changes since v0.2.0.
 
-## Features
-- auto-open incoming whispers as separate tabs (#2) (#3) (76affb2)
-- initial whispertabs scaffold (143bf64)
-
-## Other
-- wire up CurseForge project id 1664119 (b289dc3)
+## Fixes
+- detect closed tabs so new whispers reopen them (#7) (#8) (f780ec5)
 
