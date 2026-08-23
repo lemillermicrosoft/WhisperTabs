@@ -44,16 +44,38 @@ local function print_(msg)
 end
 
 -- Find an existing chat window by exact tab title (case-insensitive).
+-- Prefers a currently-shown match; falls back to a hidden match so we can
+-- ADOPT and RE-SHOW it instead of spawning yet another duplicate slot (#10).
 local function findChatFrameByName(name)
-  if not name then return nil end
+  if not name then return nil, nil end
   local target = name:lower()
+  local hiddenMatch, hiddenIdx
   for i = 1, NUM_CHAT_WINDOWS do
-    local title = GetChatWindowInfo(i)
+    local title, _, _, _, _, _, shown = GetChatWindowInfo(i)
     if title and title:lower() == target then
-      return _G["ChatFrame" .. i], i
+      local cf = _G["ChatFrame" .. i]
+      if cf then
+        if shown then return cf, i end
+        if not hiddenMatch then hiddenMatch, hiddenIdx = cf, i end
+      end
     end
   end
-  return nil
+  return hiddenMatch, hiddenIdx
+end
+
+-- Ensure a frame + its tab button are actually visible. Deliberately does NOT
+-- force-dock — that fights ElvUI's chat layout and causes visual shuffling when
+-- switching tabs. If the frame was docked before being closed, it'll re-dock
+-- naturally; if it was floating, we leave it floating.
+local function forceShowFrame(frame)
+  if not frame then return end
+  local id = frame:GetID()
+  frame:Show()
+  local tabBtn = _G["ChatFrame" .. id .. "Tab"]
+  if tabBtn then
+    tabBtn:Show()
+    if tabBtn.SetAlpha then tabBtn:SetAlpha(1) end
+  end
 end
 
 -- Configure a chat frame to only display whispers to/from playerName.
@@ -67,22 +89,47 @@ local function configureWhisperFrame(frame, playerName)
   frame.whisperTabsPlayer = playerName
 end
 
+-- Is a chat window slot still a real, user-visible tab?
+--
+-- A closed tab in WoW keeps its slot name in the saved layout but is hidden.
+-- So `name ~= ""` alone is NOT sufficient — we also need the frame to be shown.
+-- Otherwise we'll adopt a ghost slot and route whispers into an invisible tab
+-- (see issue #10 debug: slot 6 name="Deehorlok" shown=false).
+local function isFrameAlive(frame)
+  if not frame then return false end
+  local id = frame.GetID and frame:GetID() or nil
+  if not id then return false end
+  local name, _, _, _, _, _, shown = GetChatWindowInfo(id)
+  if not name or name == "" then return false end
+  if not shown then return false end
+  local tabBtn = _G["ChatFrame" .. id .. "Tab"]
+  if not tabBtn then return false end
+  if not tabBtn:IsShown() then return false end
+  return true
+end
+
 -- Create (or reuse) a tab for playerName. Returns the ChatFrame or nil.
 local function ensureTab(playerName)
   local key = keyFor(playerName)
   if not key then return nil end
 
   local existing = openTabs[key]
-  if existing and existing:IsShown() ~= nil then
+  if existing and isFrameAlive(existing) then
     return existing
+  elseif existing then
+    -- Cached frame is dead (user closed the tab). Evict and fall through.
+    openTabs[key] = nil
   end
 
   local title = tabTitleFor(playerName)
 
   -- Reuse a pre-existing tab if the user (or a prior session) already made one.
+  -- This includes HIDDEN slots with the same name — we adopt and re-show them
+  -- rather than piling up duplicates in the saved layout (#10).
   if WhisperTabsDB.routeExisting then
     local frame = findChatFrameByName(title)
     if frame then
+      forceShowFrame(frame)
       configureWhisperFrame(frame, playerName)
       openTabs[key] = frame
       return frame
@@ -115,9 +162,32 @@ local function ensureTab(playerName)
     frame = findChatFrameByName(title)
   end
   if not frame then
+    -- Second fallback: the previously-closed slot may not have been rebound to
+    -- our title. Find any inactive slot, name it, and use that.
+    for i = 1, NUM_CHAT_WINDOWS do
+      local name = GetChatWindowInfo(i)
+      if not name or name == "" then
+        local cf = _G["ChatFrame" .. i]
+        if cf and FCF_SetWindowName then
+          FCF_SetWindowName(cf, title)
+          frame = cf
+          break
+        end
+      end
+    end
+  end
+  if not frame then
     print_("failed to open tab for " .. title)
     return nil
   end
+
+  -- Force-show the frame and its tab button. FCF_Close hides both without
+  -- destroying them, and FCF_OpenNewWindow doesn't always re-show a recycled
+  -- slot (esp. under ElvUI). See issue #10.
+  forceShowFrame(frame)
+
+  -- Re-assign name in case the recycled slot kept a stale/empty one.
+  if FCF_SetWindowName then FCF_SetWindowName(frame, title) end
 
   configureWhisperFrame(frame, playerName)
   openTabs[key] = frame
@@ -147,25 +217,24 @@ end
 
 -- ---------- message routing ----------
 --
--- Correct strategy:
+-- Design (post issue #9):
 --
---   AddMessageEventFilter runs once per (event, frame) pair. We use it to
---   actively DELIVER the whisper into the correct tab (via ChatFrame_MessageEventHandler)
---   AND suppress duplicate deliveries in other whisper-capable frames, honoring
---   the duplicateInGeneral toggle for the DEFAULT_CHAT_FRAME.
+--   We DO NOT call ChatFrame_MessageEventHandler ourselves. ElvUI and other
+--   chat overhauls replace/shadow it, causing nil-call errors. WIM also warned
+--   this pattern taints in combat.
 --
--- Why we can't just rely on the default handler:
---   The default handler dispatches CHAT_MSG_WHISPER to every ChatFrame that has
---   the WHISPER message group registered at dispatch time. If we register the
---   tab lazily inside the filter, the tab is created but the *current* message
---   won't be dispatched to it — so the first whisper appears empty. Injecting
---   manually fixes that.
+--   Instead: when a tab is created/adopted, register it for the WHISPER /
+--   BN_WHISPER message groups. Blizzard's own dispatcher will then deliver
+--   subsequent whispers to it naturally, alongside any other whisper-capable
+--   frames (like General).
 --
--- To avoid the tab getting the message twice (once via our inject, once via
--- default dispatch because we registered it for WHISPER), we mark the tab
--- injected message with a token and short-circuit re-entry.
-
-local INJECT_LOCK = {} -- per-tab dedupe token, keyed by frame -> lastKey
+--   Filter's ONLY job: decide whether to suppress duplicate delivery in
+--   non-tab whisper-capable frames, honoring the duplicateInGeneral toggle.
+--
+--   Consequence: the very first whisper from a brand-new author may only
+--   appear in General (because the tab didn't exist when the current dispatch
+--   computed its target set). Every whisper after that lands in the tab.
+--   Acceptable tradeoff for zero-taint + ElvUI compatibility.
 
 local function isWhisperCapable(frame)
   local id = frame and frame:GetID()
@@ -182,61 +251,38 @@ local function makeFilter(event)
     if not WhisperTabsDB.enabled then return false end
     if not author or author == "" then return false end
 
-    -- COMBAT LOCKDOWN SAFETY (see WIM's docs, issue #6):
-    --   Calling ChatFrame_MessageEventHandler, FCF_*, or returning true from
-    --   this filter during lockdown risks tainting the default chat frame,
-    --   which cascades into broken action bars, /r keybind, etc. So during
-    --   combat: do nothing. Let Blizzard's default dispatch route the whisper
-    --   to whatever frames it normally would (General stays whisper-capable).
-    --   After combat, normal per-tab routing resumes for subsequent whispers.
+    -- COMBAT LOCKDOWN SAFETY (issue #6): do nothing during combat.
+    -- No tab creation, no suppression, no frame manipulation. Blizzard's
+    -- untampered default dispatch handles it; whispers still show in General.
     if InCombatLockdown and InCombatLockdown() then
       return false
     end
 
-    -- Ensure a tab exists for this author.
+    -- Ensure a tab exists for this author. This also registers it for the
+    -- WHISPER message groups so future dispatches deliver here automatically.
     local tab = ensureTab(author)
 
-    -- If tab creation failed (cap, or ensureTab deferred to post-combat),
-    -- fall back to default routing so the message doesn't get lost.
+    -- If tab creation failed (cap, or deferred), fall back to default routing.
     if not tab then return false end
 
-    -- Dedupe key so we don't inject the same message twice.
-    local dedupeKey = evt .. "|" .. author .. "|" .. (msg or "") .. "|" .. tostring(GetTime())
+    -- If this filter invocation is for the tab itself, allow render.
+    if chatFrame == tab then return false end
 
-    -- Case A: this filter invocation is for the TAB itself.
-    --   Let the default handler render it normally (it's registered for WHISPER).
-    --   Mark it as "seen" for suppression logic below.
-    if chatFrame == tab then
-      INJECT_LOCK[tab] = dedupeKey
-      return false
-    end
-
-    -- Case B: this filter invocation is for some OTHER frame.
-    --   Sub-case B1: the tab is NOT yet registered for WHISPER (freshly created
-    --   this tick — the default dispatcher already computed its target list
-    --   before ensureTab ran). Manually inject into the tab, then decide
-    --   whether to suppress here.
-    if INJECT_LOCK[tab] ~= dedupeKey then
-      ChatFrame_MessageEventHandler(tab, evt, msg, author, ...)
-      INJECT_LOCK[tab] = dedupeKey
-    end
-
-    -- Sub-case B2: is this frame the DEFAULT_CHAT_FRAME (General)?
-    --   Honor duplicateInGeneral: if on, keep the message here too.
+    -- For OTHER frames: decide suppression.
+    -- DEFAULT_CHAT_FRAME (General) respects duplicateInGeneral.
     if chatFrame == DEFAULT_CHAT_FRAME then
       if WhisperTabsDB.duplicateInGeneral then
-        return false -- allow default render in General
+        return false
       else
-        return true  -- suppress from General
+        return true
       end
     end
 
-    -- Sub-case B3: any other whisper-capable frame — suppress to avoid dupes.
+    -- Any other whisper-capable frame: suppress to avoid dupes.
     if isWhisperCapable(chatFrame) then
       return true
     end
 
-    -- Not whisper-capable frame; default handler will ignore anyway.
     return false
   end
 end
@@ -253,16 +299,19 @@ end
 -- Restore persisted tabs on login.
 local function restorePersistedTabs()
   if not WhisperTabsDB.persist then return end
+  local kept = {}
   for _, playerName in ipairs(WhisperTabsDB.tabs or {}) do
-    -- Attach to any existing frame by that title; don't spawn until real traffic
-    -- so we don't clutter after an /uninstall-ish cleanup.
     local title = tabTitleFor(playerName)
     local frame = findChatFrameByName(title)
-    if frame then
+    if frame and isFrameAlive(frame) then
       configureWhisperFrame(frame, playerName)
       openTabs[keyFor(playerName)] = frame
+      table.insert(kept, playerName)
     end
+    -- If not found or not alive: drop from persisted list. Next real whisper
+    -- from this player will spawn a fresh tab cleanly.
   end
+  WhisperTabsDB.tabs = kept
 end
 
 -- ---------- events ----------
@@ -304,6 +353,9 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     print_("  /wtabs max <n>       - max concurrent tabs (default 20)")
     print_("  /wtabs clear         - forget persisted tab list")
     print_("  /wtabs options       - open Blizzard options panel")
+    print_("  /wtabs cleanup       - close all hidden ghost tab slots (recovery)")
+    print_("  /wtabs debug         - dump chat window + tab tracking state")
+    print_("  /wtabs reset         - clear all WhisperTabs tab tracking")
     print_("  /wtabs status        - show current settings")
   elseif msg == "on" then
     WhisperTabsDB.enabled = true;  print_("enabled")
@@ -330,6 +382,54 @@ SlashCmdList["WHISPERTABS"] = function(msg)
   elseif msg == "clear" then
     WhisperTabsDB.tabs = {}
     print_("persisted tab list cleared (existing tabs remain until /reload)")
+  elseif msg == "cleanup" then
+    -- Find all hidden slots and Close them so Blizzard frees their names.
+    -- This cleans up ghost duplicates left over from prior WhisperTabs bugs.
+    local closed = 0
+    for i = 3, NUM_CHAT_WINDOWS do -- skip General (1) and Log (2)
+      local name, _, _, _, _, _, shown = GetChatWindowInfo(i)
+      if name and name ~= "" and not shown then
+        local cf = _G["ChatFrame" .. i]
+        if cf then
+          if FCF_Close then FCF_Close(cf) end
+          -- FCF_Close hides but preserves the name in saved layout. Force-clear
+          -- name and message groups so the slot becomes reusable / empty.
+          if FCF_SetWindowName then FCF_SetWindowName(cf, " ") end -- Blizzard rejects ""
+          if ChatFrame_RemoveAllMessageGroups then
+            ChatFrame_RemoveAllMessageGroups(cf)
+          end
+          closed = closed + 1
+        end
+      end
+    end
+    for k in pairs(openTabs) do openTabs[k] = nil end
+    WhisperTabsDB.tabs = {}
+    print_(string.format("cleanup: closed %d hidden ghost slot(s). /reload REQUIRED to persist.", closed))
+  elseif msg == "debug" then
+    print_("--- debug dump ---")
+    print_("NUM_CHAT_WINDOWS=" .. tostring(NUM_CHAT_WINDOWS))
+    for i = 1, NUM_CHAT_WINDOWS do
+      local name, _, _, _, _, _, shown, _, docked = GetChatWindowInfo(i)
+      local cf = _G["ChatFrame" .. i]
+      local visible = cf and cf:IsShown()
+      print_(string.format("  slot %d: name=%q shown=%s visible=%s docked=%s",
+        i, tostring(name or ""), tostring(shown), tostring(visible), tostring(docked)))
+    end
+    print_("openTabs runtime map:")
+    for k, f in pairs(openTabs) do
+      local fid = f and f.GetID and f:GetID() or "?"
+      local alive = isFrameAlive(f)
+      print_(string.format("  %s -> ChatFrame%s alive=%s", tostring(k), tostring(fid), tostring(alive)))
+    end
+    print_("persisted list (WhisperTabsDB.tabs):")
+    for i, n in ipairs(WhisperTabsDB.tabs or {}) do
+      print_(string.format("  [%d] %s", i, tostring(n)))
+    end
+    print_("--- end debug ---")
+  elseif msg == "reset" then
+    WhisperTabsDB.tabs = {}
+    for k in pairs(openTabs) do openTabs[k] = nil end
+    print_("reset runtime + persisted tab tracking. /reload for a clean slate.")
   elseif msg == "status" then
     print_(string.format("enabled=%s autoSwitch=%s duplicateInGeneral=%s persist=%s maxTabs=%d openTabs=%d",
       tostring(WhisperTabsDB.enabled), tostring(WhisperTabsDB.autoSwitch),
