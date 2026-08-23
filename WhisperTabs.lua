@@ -392,15 +392,21 @@ SlashCmdList["WHISPERTABS"] = function(msg)
       local name, _, _, _, _, _, shown = GetChatWindowInfo(i)
       if name and name ~= "" and not shown then
         local cf = _G["ChatFrame" .. i]
-        if cf and FCF_Close then
-          FCF_Close(cf)
+        if cf then
+          if FCF_Close then FCF_Close(cf) end
+          -- FCF_Close hides but preserves the name in saved layout. Force-clear
+          -- name and message groups so the slot becomes reusable / empty.
+          if FCF_SetWindowName then FCF_SetWindowName(cf, " ") end -- Blizzard rejects ""
+          if ChatFrame_RemoveAllMessageGroups then
+            ChatFrame_RemoveAllMessageGroups(cf)
+          end
           closed = closed + 1
         end
       end
     end
     for k in pairs(openTabs) do openTabs[k] = nil end
     WhisperTabsDB.tabs = {}
-    print_(string.format("cleanup: closed %d hidden ghost slot(s). /reload recommended.", closed))
+    print_(string.format("cleanup: closed %d hidden ghost slot(s). /reload REQUIRED to persist.", closed))
   elseif msg == "debug" then
     print_("--- debug dump ---")
     print_("NUM_CHAT_WINDOWS=" .. tostring(NUM_CHAT_WINDOWS))
