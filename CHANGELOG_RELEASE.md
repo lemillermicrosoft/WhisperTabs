@@ -1,7 +1,7 @@
-﻿# v0.2.1
+﻿# v0.2.2
 
-Changes since v0.2.0.
+Changes since v0.2.1.
 
 ## Fixes
-- detect closed tabs so new whispers reopen them (#7) (#8) (f780ec5)
+- BN tab collisions, floating windows, missing INFORMs (#12) (#13) (352bb93)
 
