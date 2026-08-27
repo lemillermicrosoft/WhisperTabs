@@ -35,13 +35,28 @@ local function tabTitleFor(playerName)
   return base
 end
 
+-- Keys uniquely identify a conversation for our runtime map.
+-- Non-BN whispers key by the full (cross-realm-safe) player name, lowercased.
+-- BN whispers key by the invisible bnetIDAccount so we do NOT collide with
+-- pre-existing user tabs that happen to share a title with the BN presenceName
+-- (issue #12: e.g. Nokkar's BN presenceName "Sarah Green" collided with an
+-- unrelated IRL contact tab titled "Sarah Green").
 local function keyFor(playerName)
   return playerName and playerName:lower() or nil
+end
+
+local function bnKeyFor(bnetIDAccount)
+  if not bnetIDAccount then return nil end
+  return "bn:" .. tostring(bnetIDAccount)
 end
 
 local function print_(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffWhisperTabs|r: " .. tostring(msg))
 end
+
+-- Map bnetIDAccount -> presenceName last seen, so INFORM (which lacks author
+-- string for BN in some paths) can still resolve back to a title.
+local bnDisplayName = {}
 
 -- Find an existing chat window by exact tab title (case-insensitive).
 -- Prefers a currently-shown match; falls back to a hidden match so we can
@@ -108,9 +123,31 @@ local function isFrameAlive(frame)
   return true
 end
 
+-- Force a chat frame into the main chat dock. Prevents floating whisper tabs
+-- from overlapping and un-glowing the unread highlight (#12). We only dock
+-- when the frame is a real chat frame that Blizzard's dock manager accepts.
+local function forceDockFrame(frame)
+  if not frame or not FCF_DockFrame then return end
+  -- Avoid touching in combat (docking manipulates protected UI in some clients).
+  if InCombatLockdown and InCombatLockdown() then return end
+  -- Already docked? Nothing to do.
+  local id = frame.GetID and frame:GetID()
+  if id then
+    local _, _, _, _, _, _, _, _, docked = GetChatWindowInfo(id)
+    if docked and docked ~= 0 and docked ~= false then return end
+  end
+  -- Dock to the default chat frame's dock.
+  pcall(FCF_DockFrame, frame)
+end
+
 -- Create (or reuse) a tab for playerName. Returns the ChatFrame or nil.
-local function ensureTab(playerName)
-  local key = keyFor(playerName)
+-- `opts` (optional): { bnetIDAccount = <number>, isBN = <bool> }
+--   - When isBN is true we key/track by bnetIDAccount to avoid title-collision
+--     with pre-existing user tabs (#12).
+local function ensureTab(playerName, opts)
+  opts = opts or {}
+  local isBN = opts.isBN and opts.bnetIDAccount
+  local key = isBN and bnKeyFor(opts.bnetIDAccount) or keyFor(playerName)
   if not key then return nil end
 
   local existing = openTabs[key]
@@ -122,14 +159,23 @@ local function ensureTab(playerName)
   end
 
   local title = tabTitleFor(playerName)
+  if isBN then
+    -- Remember display name for later INFORM lookups.
+    if playerName then bnDisplayName[opts.bnetIDAccount] = playerName end
+  end
 
   -- Reuse a pre-existing tab if the user (or a prior session) already made one.
   -- This includes HIDDEN slots with the same name — we adopt and re-show them
   -- rather than piling up duplicates in the saved layout (#10).
-  if WhisperTabsDB.routeExisting then
+  --
+  -- BN whispers SKIP this adoption path: their titles are user-controlled
+  -- presenceNames that frequently collide with unrelated user tabs (issue #12).
+  -- Always spawn a fresh tab for BN convos and rely on the bnetIDAccount key.
+  if WhisperTabsDB.routeExisting and not isBN then
     local frame = findChatFrameByName(title)
     if frame then
       forceShowFrame(frame)
+      forceDockFrame(frame)
       configureWhisperFrame(frame, playerName)
       openTabs[key] = frame
       return frame
@@ -186,6 +232,10 @@ local function ensureTab(playerName)
   -- slot (esp. under ElvUI). See issue #10.
   forceShowFrame(frame)
 
+  -- Dock the new frame so it doesn't float over the main chat and so the
+  -- unread-message tab glow works (#12).
+  forceDockFrame(frame)
+
   -- Re-assign name in case the recycled slot kept a stale/empty one.
   if FCF_SetWindowName then FCF_SetWindowName(frame, title) end
 
@@ -204,8 +254,10 @@ local function ensureTab(playerName)
     end
   end
 
-  if WhisperTabsDB.persist then
+  if WhisperTabsDB.persist and not isBN then
     -- Store by normalized full name so cross-realm re-open works.
+    -- BN tabs are session-only for now (persistence would require also saving
+    -- bnetIDAccount and re-resolving presenceName on login, which is fragile).
     local list = WhisperTabsDB.tabs
     local seen = false
     for _, n in ipairs(list) do if n:lower() == key then seen = true break end end
@@ -246,44 +298,118 @@ local function isWhisperCapable(frame)
   return false
 end
 
+-- Track which (event, author-key, msg) triples the tab has ALREADY seen this
+-- session tick, so we don't double-print when Blizzard's dispatcher also lands
+-- the message on the tab naturally (post-registration).
+--
+-- Keyed by tab frame identity so distinct convos don't clobber each other.
+local replayedInTab = setmetatable({}, { __mode = "k" })
+local function markReplayed(tab, event, author, msg)
+  local t = replayedInTab[tab]
+  if not t then t = {}; replayedInTab[tab] = t end
+  t[tostring(event) .. "|" .. tostring(author) .. "|" .. tostring(msg)] = GetTime and GetTime() or 0
+end
+local function alreadyReplayed(tab, event, author, msg)
+  local t = replayedInTab[tab]
+  if not t then return false end
+  return t[tostring(event) .. "|" .. tostring(author) .. "|" .. tostring(msg)] ~= nil
+end
+
+-- Render a whisper into the target tab using tab:AddMessage. Deliberately
+-- does NOT call ChatFrame_MessageEventHandler — that's shadowed by ElvUI and
+-- caused issue #9. We reproduce Blizzard's default whisper coloring here.
+local function renderInTab(tab, event, msg, author)
+  if not tab or not tab.AddMessage then return end
+  msg = msg or ""
+  author = author or "?"
+  -- Blizzard whisper color: ChatTypeInfo["WHISPER"] { r, g, b }.
+  local info = ChatTypeInfo and (ChatTypeInfo["WHISPER"] or ChatTypeInfo["BN_WHISPER"])
+  local r, g, b = 1.0, 0.5, 1.0
+  if info then r, g, b = info.r or r, info.g or g, info.b or b end
+
+  local playerLink = string.format("|Hplayer:%s|h[%s]|h", author, author)
+  local line
+  if event == "CHAT_MSG_WHISPER" then
+    line = string.format("%s whispers: %s", playerLink, msg)
+  elseif event == "CHAT_MSG_WHISPER_INFORM" then
+    line = string.format("To %s: %s", playerLink, msg)
+  elseif event == "CHAT_MSG_BN_WHISPER" then
+    line = string.format("[%s]: %s", author, msg)
+  elseif event == "CHAT_MSG_BN_WHISPER_INFORM" then
+    line = string.format("To [%s]: %s", author, msg)
+  else
+    line = msg
+  end
+  tab:AddMessage(line, r, g, b)
+end
+
 local function makeFilter(event)
+  local isBNEvent = (event == "CHAT_MSG_BN_WHISPER" or event == "CHAT_MSG_BN_WHISPER_INFORM")
   return function(chatFrame, evt, msg, author, ...)
     if not WhisperTabsDB.enabled then return false end
     if not author or author == "" then return false end
 
     -- COMBAT LOCKDOWN SAFETY (issue #6): do nothing during combat.
-    -- No tab creation, no suppression, no frame manipulation. Blizzard's
-    -- untampered default dispatch handles it; whispers still show in General.
     if InCombatLockdown and InCombatLockdown() then
       return false
     end
 
-    -- Ensure a tab exists for this author. This also registers it for the
-    -- WHISPER message groups so future dispatches deliver here automatically.
-    local tab = ensureTab(author)
+    -- BN whispers: extract bnetIDAccount so we can key the tab by an invisible
+    -- ID (#12). Classic 2.5.6 CHAT_MSG_BN_WHISPER* signature after author:
+    -- lang(5), chan(6), target(7), flags(8), zone(9), chanIdx(10), chanBase(11),
+    -- unused(12), lineID(13), guid(14), bnetIDAccount(15).
+    -- Inside this closure, ... starts at arg #5, so bnetIDAccount = select(11, ...).
+    local bnetIDAccount = nil
+    if isBNEvent then
+      bnetIDAccount = select(11, ...)
+    end
+
+    -- Ensure a tab exists for this conversation.
+    local tab
+    if isBNEvent then
+      tab = ensureTab(author, { isBN = true, bnetIDAccount = bnetIDAccount })
+    else
+      tab = ensureTab(author)
+    end
 
     -- If tab creation failed (cap, or deferred), fall back to default routing.
     if not tab then return false end
 
-    -- If this filter invocation is for the tab itself, allow render.
-    if chatFrame == tab then return false end
+    -- If this filter invocation is for the tab itself: allow render and mark
+    -- so a subsequent replay (see below) knows to skip.
+    if chatFrame == tab then
+      markReplayed(tab, evt, author, msg)
+      return false
+    end
 
-    -- For OTHER frames: decide suppression.
-    -- DEFAULT_CHAT_FRAME (General) respects duplicateInGeneral.
+    -- Decide suppression for other frames.
+    local suppress
     if chatFrame == DEFAULT_CHAT_FRAME then
-      if WhisperTabsDB.duplicateInGeneral then
-        return false
-      else
-        return true
-      end
+      suppress = (not WhisperTabsDB.duplicateInGeneral)
+    elseif isWhisperCapable(chatFrame) then
+      suppress = true
+    else
+      suppress = false
     end
 
-    -- Any other whisper-capable frame: suppress to avoid dupes.
-    if isWhisperCapable(chatFrame) then
-      return true
+    -- Ensure the tab actually SEES the message this tick, even if Blizzard's
+    -- dispatcher didn't route to it yet (#12: outgoing INFORMs and first
+    -- messages from brand-new authors). We only replay from the General-frame
+    -- filter invocation, so we run at most once per event, and we defer to a
+    -- 0-timer so any real dispatch to the tab wins and marks replayedInTab.
+    if chatFrame == DEFAULT_CHAT_FRAME then
+      local capturedEvt, capturedMsg, capturedAuthor = evt, msg, author
+      local capturedTab = tab
+      C_Timer.After(0, function()
+        if alreadyReplayed(capturedTab, capturedEvt, capturedAuthor, capturedMsg) then
+          return
+        end
+        renderInTab(capturedTab, capturedEvt, capturedMsg, capturedAuthor)
+        markReplayed(capturedTab, capturedEvt, capturedAuthor, capturedMsg)
+      end)
     end
 
-    return false
+    return suppress
   end
 end
 
@@ -305,6 +431,7 @@ local function restorePersistedTabs()
     local frame = findChatFrameByName(title)
     if frame and isFrameAlive(frame) then
       configureWhisperFrame(frame, playerName)
+      forceDockFrame(frame) -- keep restored tabs docked (#12)
       openTabs[keyFor(playerName)] = frame
       table.insert(kept, playerName)
     end
@@ -327,7 +454,7 @@ f:SetScript("OnEvent", function(self, event, arg1)
   elseif event == "PLAYER_LOGIN" then
     restorePersistedTabs()
     installFilters()
-    print_("v0.1.0 loaded. /whispertabs for options.")
+    print_("loaded. /whispertabs for options.")
   elseif event == "PLAYER_REGEN_ENABLED" then
     if ns.pendingTabs then
       for key, name in pairs(ns.pendingTabs) do
