@@ -17,6 +17,16 @@ local defaults = {
 -- Runtime state: playerName (normalized) -> ChatFrame table.
 local openTabs = {}
 
+-- Ring buffer of recent whisper events for /wtabs report (see issue #14).
+-- Each entry: { t=GetTime, event=, author=, msgLen=, key=, tabId=, replayed=bool, note= }.
+local REPORT_MAX = 40
+local reportRing = {}
+local function reportPush(entry)
+  entry.t = GetTime and GetTime() or 0
+  table.insert(reportRing, entry)
+  while #reportRing > REPORT_MAX do table.remove(reportRing, 1) end
+end
+
 -- ---------- helpers ----------
 
 local function initDB()
@@ -318,29 +328,66 @@ end
 -- Render a whisper into the target tab using tab:AddMessage. Deliberately
 -- does NOT call ChatFrame_MessageEventHandler — that's shadowed by ElvUI and
 -- caused issue #9. We reproduce Blizzard's default whisper coloring here.
+--
+-- Color handling (#14): ChatTypeInfo can be stomped or partially populated by
+-- other addons in some contexts. Always fall back to Blizzard's known whisper
+-- RGB (1.0, 0.5, 1.0 — the classic pink) if the info table is missing OR any
+-- component is nil.
+--
+-- BN links (#14): presenceNames contain spaces, which break |Hplayer:...|h and
+-- swallow color codes downstream. Use a plain bracketed name for BN events.
+local function whisperColor(event)
+  local key = (event == "CHAT_MSG_BN_WHISPER" or event == "CHAT_MSG_BN_WHISPER_INFORM")
+    and "BN_WHISPER" or "WHISPER"
+  local info = ChatTypeInfo and ChatTypeInfo[key]
+  local r = info and info.r or 1.0
+  local g = info and info.g or 0.5
+  local b = info and info.b or 1.0
+  -- Guard against nil-per-component (rare but seen in the wild under heavy addons).
+  if r == nil then r = 1.0 end
+  if g == nil then g = 0.5 end
+  if b == nil then b = 1.0 end
+  return r, g, b
+end
+
 local function renderInTab(tab, event, msg, author)
   if not tab or not tab.AddMessage then return end
   msg = msg or ""
   author = author or "?"
-  -- Blizzard whisper color: ChatTypeInfo["WHISPER"] { r, g, b }.
-  local info = ChatTypeInfo and (ChatTypeInfo["WHISPER"] or ChatTypeInfo["BN_WHISPER"])
-  local r, g, b = 1.0, 0.5, 1.0
-  if info then r, g, b = info.r or r, info.g or g, info.b or b end
+  local r, g, b = whisperColor(event)
 
-  local playerLink = string.format("|Hplayer:%s|h[%s]|h", author, author)
+  local isBN = (event == "CHAT_MSG_BN_WHISPER" or event == "CHAT_MSG_BN_WHISPER_INFORM")
+  local nameToken
+  if isBN then
+    -- Spaces in presenceName break the player-link hyperlink.
+    nameToken = string.format("[%s]", author)
+  else
+    nameToken = string.format("|Hplayer:%s|h[%s]|h", author, author)
+  end
+
   local line
   if event == "CHAT_MSG_WHISPER" then
-    line = string.format("%s whispers: %s", playerLink, msg)
+    line = string.format("%s whispers: %s", nameToken, msg)
   elseif event == "CHAT_MSG_WHISPER_INFORM" then
-    line = string.format("To %s: %s", playerLink, msg)
+    line = string.format("To %s: %s", nameToken, msg)
   elseif event == "CHAT_MSG_BN_WHISPER" then
-    line = string.format("[%s]: %s", author, msg)
+    line = string.format("%s: %s", nameToken, msg)
   elseif event == "CHAT_MSG_BN_WHISPER_INFORM" then
-    line = string.format("To [%s]: %s", author, msg)
+    line = string.format("To %s: %s", nameToken, msg)
   else
     line = msg
   end
   tab:AddMessage(line, r, g, b)
+end
+
+-- Per-tick dedupe so we schedule the replay closure at most once per event,
+-- regardless of which filter invocation (General, tab, other whisper-capable
+-- frame) gets to it first. Keyed by event|author|msg with the current game
+-- time truncated to millisecond precision. Cleared opportunistically.
+local scheduledReplay = {}
+local function scheduleKey(evt, author, msg)
+  local now = GetTime and GetTime() or 0
+  return string.format("%s|%s|%s|%.3f", tostring(evt), tostring(author), tostring(msg), now)
 end
 
 local function makeFilter(event)
@@ -364,6 +411,20 @@ local function makeFilter(event)
       bnetIDAccount = select(11, ...)
     end
 
+    -- Compute a stable tab key up-front so the deferred replay can re-resolve
+    -- the *current* tab for this author (#14 anti cross-routing). Capturing
+    -- the tab reference at filter time and using it inside the timer callback
+    -- was fine in isolation, but if two whispers from different authors arrive
+    -- in the same tick and the second call to ensureTab churns the map (e.g.
+    -- adoption re-uses a slot), the first closure could render into the wrong
+    -- frame. Re-resolving from openTabs by key at fire-time avoids that.
+    local resolveKey
+    if isBNEvent then
+      resolveKey = bnKeyFor(bnetIDAccount)
+    else
+      resolveKey = keyFor(author)
+    end
+
     -- Ensure a tab exists for this conversation.
     local tab
     if isBNEvent then
@@ -371,6 +432,15 @@ local function makeFilter(event)
     else
       tab = ensureTab(author)
     end
+
+    -- Log for /wtabs report regardless of what happens next.
+    reportPush({
+      event = evt, author = author, msgLen = #(msg or ""),
+      key = resolveKey,
+      tabId = (tab and tab.GetID and tab:GetID()) or nil,
+      frame = chatFrame and chatFrame.GetID and chatFrame:GetID() or nil,
+      isBN = isBNEvent,
+    })
 
     -- If tab creation failed (cap, or deferred), fall back to default routing.
     if not tab then return false end
@@ -393,19 +463,34 @@ local function makeFilter(event)
     end
 
     -- Ensure the tab actually SEES the message this tick, even if Blizzard's
-    -- dispatcher didn't route to it yet (#12: outgoing INFORMs and first
-    -- messages from brand-new authors). We only replay from the General-frame
-    -- filter invocation, so we run at most once per event, and we defer to a
-    -- 0-timer so any real dispatch to the tab wins and marks replayedInTab.
-    if chatFrame == DEFAULT_CHAT_FRAME then
+    -- dispatcher didn't route to it yet. Previously we only scheduled from
+    -- DEFAULT_CHAT_FRAME's invocation, which meant profiles where General
+    -- doesn't receive the filter call (e.g. General not whisper-capable, or
+    -- ElvUI reordering) would silently drop the replay and the tab would show
+    -- nothing (#14). Now: any non-tab filter invocation may schedule, but we
+    -- dedupe by (event, author, msg, ~tick) so only ONE closure ever fires.
+    local skey = scheduleKey(evt, author, msg)
+    if not scheduledReplay[skey] then
+      scheduledReplay[skey] = true
       local capturedEvt, capturedMsg, capturedAuthor = evt, msg, author
-      local capturedTab = tab
+      local capturedKey = resolveKey
       C_Timer.After(0, function()
-        if alreadyReplayed(capturedTab, capturedEvt, capturedAuthor, capturedMsg) then
+        scheduledReplay[skey] = nil
+        -- Re-resolve the tab *now* by key, so we always render into the
+        -- current tab for this author (#14 anti cross-routing).
+        local liveTab = capturedKey and openTabs[capturedKey] or nil
+        if not liveTab or not isFrameAlive(liveTab) then return end
+        if alreadyReplayed(liveTab, capturedEvt, capturedAuthor, capturedMsg) then
           return
         end
-        renderInTab(capturedTab, capturedEvt, capturedMsg, capturedAuthor)
-        markReplayed(capturedTab, capturedEvt, capturedAuthor, capturedMsg)
+        renderInTab(liveTab, capturedEvt, capturedMsg, capturedAuthor)
+        markReplayed(liveTab, capturedEvt, capturedAuthor, capturedMsg)
+        -- Update the last report entry with the replay outcome (best-effort).
+        local last = reportRing[#reportRing]
+        if last and last.event == capturedEvt and last.author == capturedAuthor then
+          last.replayed = true
+          last.renderedTabId = liveTab.GetID and liveTab:GetID() or nil
+        end
       end)
     end
 
@@ -481,6 +566,7 @@ SlashCmdList["WHISPERTABS"] = function(msg)
     print_("  /wtabs clear         - forget persisted tab list")
     print_("  /wtabs options       - open Blizzard options panel")
     print_("  /wtabs cleanup       - close all hidden ghost tab slots (recovery)")
+    print_("  /wtabs report        - dump last ~40 whisper events (raid diagnostics)")
     print_("  /wtabs debug         - dump chat window + tab tracking state")
     print_("  /wtabs reset         - clear all WhisperTabs tab tracking")
     print_("  /wtabs status        - show current settings")
@@ -553,6 +639,26 @@ SlashCmdList["WHISPERTABS"] = function(msg)
       print_(string.format("  [%d] %s", i, tostring(n)))
     end
     print_("--- end debug ---")
+  elseif msg == "report" or msg == "report copy" then
+    -- In-raid diagnostics (#14): show the recent whisper ring buffer. Also
+    -- persist a snapshot to WhisperTabsDB.lastReport so deehoc can view it
+    -- later with /dump WhisperTabsDB.lastReport, share via export, etc.
+    print_("--- whisper report (last " .. tostring(#reportRing) .. " events) ---")
+    local snapshot = {}
+    for i, e in ipairs(reportRing) do
+      local line = string.format(
+        "%2d) t=%.1f evt=%s author=%q key=%s tab=%s frame=%s bn=%s replayed=%s%s",
+        i, e.t or 0, tostring(e.event):gsub("CHAT_MSG_",""),
+        tostring(e.author), tostring(e.key),
+        tostring(e.tabId), tostring(e.frame),
+        tostring(e.isBN), tostring(e.replayed and true or false),
+        e.renderedTabId and (" rendered=" .. tostring(e.renderedTabId)) or ""
+      )
+      print_(line)
+      snapshot[i] = line
+    end
+    WhisperTabsDB.lastReport = snapshot
+    print_("--- end report (saved to WhisperTabsDB.lastReport) ---")
   elseif msg == "reset" then
     WhisperTabsDB.tabs = {}
     for k in pairs(openTabs) do openTabs[k] = nil end
