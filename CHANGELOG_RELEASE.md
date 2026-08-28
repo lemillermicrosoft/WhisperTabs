@@ -1,7 +1,7 @@
-﻿# v0.2.2
+﻿# v0.2.3
 
-Changes since v0.2.1.
+Changes since v0.2.2.
 
 ## Fixes
-- BN tab collisions, floating windows, missing INFORMs (#12) (#13) (352bb93)
+- whisper colors, cross-routing, add /wtabs report (#14) (#15) (affbd6e)
 
