@@ -71,7 +71,14 @@ local bnDisplayName = {}
 -- Find an existing chat window by exact tab title (case-insensitive).
 -- Prefers a currently-shown match; falls back to a hidden match so we can
 -- ADOPT and RE-SHOW it instead of spawning yet another duplicate slot (#10).
-local function findChatFrameByName(name)
+--
+-- ownerKey (optional, issue #16): when set, only return a frame that either
+-- (a) has no WhisperTabs owner tag yet (unowned — safe to adopt), or
+-- (b) is already tagged as belonging to this exact ownerKey.
+-- This prevents cross-routing when two players share a realm-stripped title
+-- (e.g. "Sarah-RealmA" and "Sarah-RealmB" both render title "Sarah") or
+-- when a stale ghost slot with a colliding title exists from a prior session.
+local function findChatFrameByName(name, ownerKey)
   if not name then return nil, nil end
   local target = name:lower()
   local hiddenMatch, hiddenIdx
@@ -80,8 +87,14 @@ local function findChatFrameByName(name)
     if title and title:lower() == target then
       local cf = _G["ChatFrame" .. i]
       if cf then
-        if shown then return cf, i end
-        if not hiddenMatch then hiddenMatch, hiddenIdx = cf, i end
+        -- Owner-tag guard (#16): if we're asked for a specific ownerKey, refuse
+        -- to hand back a frame that is tagged as owned by a *different* key.
+        local frameOwner = cf.whisperTabsOwnerKey
+        local ownerOk = (ownerKey == nil) or (frameOwner == nil) or (frameOwner == ownerKey)
+        if ownerOk then
+          if shown then return cf, i end
+          if not hiddenMatch then hiddenMatch, hiddenIdx = cf, i end
+        end
       end
     end
   end
@@ -104,7 +117,9 @@ local function forceShowFrame(frame)
 end
 
 -- Configure a chat frame to only display whispers to/from playerName.
-local function configureWhisperFrame(frame, playerName)
+-- Also tags the frame with ownerKey so future adoption attempts can tell
+-- which conversation this frame belongs to (#16 anti cross-routing).
+local function configureWhisperFrame(frame, playerName, ownerKey)
   if not frame then return end
   -- Clear all existing message groups on this frame, then add whisper groups only.
   ChatFrame_RemoveAllMessageGroups(frame)
@@ -112,6 +127,7 @@ local function configureWhisperFrame(frame, playerName)
   ChatFrame_AddMessageGroup(frame, "BN_WHISPER")
   -- Track per-player channel filtering via a message filter (below).
   frame.whisperTabsPlayer = playerName
+  frame.whisperTabsOwnerKey = ownerKey
 end
 
 -- Is a chat window slot still a real, user-visible tab?
@@ -181,12 +197,15 @@ local function ensureTab(playerName, opts)
   -- BN whispers SKIP this adoption path: their titles are user-controlled
   -- presenceNames that frequently collide with unrelated user tabs (issue #12).
   -- Always spawn a fresh tab for BN convos and rely on the bnetIDAccount key.
+  --
+  -- #16: pass ownerKey so we don't cross-route into a tab tagged for a
+  -- different conversation (realm-stripped title collisions, stale ghost slots).
   if WhisperTabsDB.routeExisting and not isBN then
-    local frame = findChatFrameByName(title)
+    local frame = findChatFrameByName(title, key)
     if frame then
       forceShowFrame(frame)
       forceDockFrame(frame)
-      configureWhisperFrame(frame, playerName)
+      configureWhisperFrame(frame, playerName, key)
       openTabs[key] = frame
       return frame
     end
@@ -249,7 +268,7 @@ local function ensureTab(playerName, opts)
   -- Re-assign name in case the recycled slot kept a stale/empty one.
   if FCF_SetWindowName then FCF_SetWindowName(frame, title) end
 
-  configureWhisperFrame(frame, playerName)
+  configureWhisperFrame(frame, playerName, key)
   openTabs[key] = frame
 
   -- FCF_OpenNewWindow selects the new tab. Restore focus unless the user opted in,
@@ -508,17 +527,35 @@ local function installFilters()
 end
 
 -- Restore persisted tabs on login.
+--
+-- #16: two persisted names can share a realm-stripped title (e.g. "Sarah").
+-- If we naively call findChatFrameByName(title) for each, both persisted keys
+-- end up pointing at the SAME physical frame — any whisper to either name
+-- then renders into the same tab (cross-routing). Track which frame IDs
+-- we've already claimed this restore pass and skip duplicates: the loser
+-- gets dropped from the persisted list and will spawn its own fresh tab on
+-- next whisper.
 local function restorePersistedTabs()
   if not WhisperTabsDB.persist then return end
   local kept = {}
+  local claimedFrames = {}
   for _, playerName in ipairs(WhisperTabsDB.tabs or {}) do
     local title = tabTitleFor(playerName)
-    local frame = findChatFrameByName(title)
+    local key = keyFor(playerName)
+    local frame = findChatFrameByName(title, key)
     if frame and isFrameAlive(frame) then
-      configureWhisperFrame(frame, playerName)
-      forceDockFrame(frame) -- keep restored tabs docked (#12)
-      openTabs[keyFor(playerName)] = frame
-      table.insert(kept, playerName)
+      local fid = frame.GetID and frame:GetID() or nil
+      if fid and claimedFrames[fid] then
+        -- Another persisted name already claimed this frame this pass. Drop
+        -- the collision to avoid cross-routing (#16). This player will get a
+        -- fresh tab on their next whisper.
+      else
+        configureWhisperFrame(frame, playerName, key)
+        forceDockFrame(frame) -- keep restored tabs docked (#12)
+        openTabs[key] = frame
+        if fid then claimedFrames[fid] = true end
+        table.insert(kept, playerName)
+      end
     end
     -- If not found or not alive: drop from persisted list. Next real whisper
     -- from this player will spawn a fresh tab cleanly.
