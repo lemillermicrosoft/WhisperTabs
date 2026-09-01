@@ -1,7 +1,7 @@
-﻿# v0.2.3
+﻿# v0.2.4
 
-Changes since v0.2.2.
+Changes since v0.2.3.
 
 ## Fixes
-- whisper colors, cross-routing, add /wtabs report (#14) (#15) (affbd6e)
+- prevent wrong-tab cross-routing on whisper (#16) (#17) (596b560)
 

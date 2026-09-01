@@ -2,12 +2,13 @@
 ## Title: WhisperTabs
 ## Notes: Auto-open incoming whispers as separate tabs in the default chat window, one tab per conversation.
 ## Author: GitHub Copilot c/o deehoc
-## Version: 0.2.3
+## Version: 0.2.4
 ## IconTexture: Interface\AddOns\WhisperTabs\Media\icon.png
 ## SavedVariables: WhisperTabsDB
 
 WhisperTabs.lua
 Options.lua
+
 
 
 
